@@ -50,6 +50,24 @@ created-at date from `trajectory_metadata_blob` (file mtime fallback);
 conversations spanning midnight land on their starting day. "Prompts" in
 the record are generations (model calls), not user prompts.
 
+## Multi-pane panel fork (eins0fx.agents)
+
+The stock panel shows one provider at a time behind a chip switcher. The
+fork in `plugin/eins0fx.agents/` shows every enabled provider side by side,
+one column each, no clicking. It was made with the sanctioned
+`omarchy plugin clone omarchy.agents` (which also swaps the bar layout entry
+in `~/.config/omarchy/shell.json` to `eins0fx.agents`), then `Panel.qml` was
+reworked: selection state and the chip row are gone, the per-provider
+sections became a `ProviderPane` component instantiated in a Row, panes
+split the panel viewport exactly (min width 300, else horizontal pan), the
+bar icon alarms if ANY provider crosses 90%, middle-click refreshes instead
+of cycling, and `h`/`l` pan horizontally. User plugins live in
+`~/.config/omarchy/plugins/` and survive omarchy upgrades untouched; the
+live copy IS the user config, this directory is the versioned backup
+(restore with `cp -r plugin/eins0fx.agents ~/.config/omarchy/plugins/`).
+Quickshell's hot reload does not rebuild already-instantiated bar widgets,
+so after editing run `omarchy-restart-shell`.
+
 ## Install / update
 
 ```

@@ -301,8 +301,11 @@ def parse_usage_output(text: str) -> list[dict]:
     group = GROUP_LABELS.get(match.group("group").strip().lower(), match.group("group").strip())
     window = WINDOW_LABELS.get(match.group("window").strip().lower(), match.group("window").strip())
     remaining = min(100, max(0, int(match.group("pct"))))
+    # The panel derives a short window title from the label unless the record
+    # names one; without it both groups collapse to "Session"/"Weekly".
     limits.append({
       "label": f"{group} {window}",
+      "title": f"{group} {window}",
       "percent": round((100 - remaining) / 100.0, 4),
       "resetsAt": match.group("reset"),
     })
