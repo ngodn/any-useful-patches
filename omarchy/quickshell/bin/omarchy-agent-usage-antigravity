@@ -1,0 +1,445 @@
+#!/usr/bin/python3
+# omarchy:summary=Print the Google Antigravity usage record as JSON
+# omarchy:args=[--force] [--limits-only]
+# omarchy:hidden=true
+"""Collect Google Antigravity (agy) usage into one display-ready JSON record.
+
+Two sources, mirroring the shipped claude/codex collectors:
+
+- Rate limits come from `agy -p "/usage"`, which prints a quota table with a
+  remaining percentage and reset time per window (Gemini and Claude/GPT, each
+  with a 5-hour and a weekly window). agy handles its own auth (system
+  keyring with file fallback), so no OAuth handling lives here.
+- Local token stats come from the conversation databases the Antigravity CLI
+  writes under ~/.gemini/antigravity-cli/conversations/*.db (and the IDE's
+  ~/.gemini/antigravity/conversations/ when present). Each `gen_metadata`
+  row is one generation encoded as a GeneratorMetadata protobuf; the field
+  numbers were cross-checked against tokscale's reverse-engineered reader
+  (junhoyeo/tokscale, crates/tokscale-core/src/sessions/antigravity_cli.rs):
+
+    #1 chatModel message
+       #19 string  responseModel        (e.g. gemini-3.7-flash)
+       #21 string  model display label  (fallback when #19 is absent)
+       #4  usage message
+           #1  varint fixed system-prompt tokens
+           #2  varint newly-processed (non-cached) input tokens
+           #5  varint cacheRead tokens
+           #9  varint output (text) tokens
+           #10 varint thinking tokens
+           #11 string responseId (dedup key)
+    trajectory_metadata_blob.#2 = {#1: seconds} -> conversation created-at
+
+  Per-generation timestamps are not decodable on current agy builds, so
+  turns are bucketed by their conversation's created-at date (file mtime as
+  fallback). Conversations that span midnight land on their starting day.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import fcntl
+import glob
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+AGENT_ID = "antigravity"
+AGENT_NAME = "Antigravity"
+AUTH_HELP = "Run `agy` once and sign in to restore quota reporting."
+LIMITS_REUSE_SECONDS = 600  # agy startup is heavy; don't relaunch it per tick
+USAGE_TIMEOUT_SECONDS = 90
+
+QUOTA_LINE = re.compile(
+  r"^(?P<group>.+?)\s{2,}(?P<window>.+?)\s+Limit\s+Remaining\s+(?P<pct>\d+)%\s+(?P<reset>\S+)\s*$"
+)
+
+GROUP_LABELS = {
+  "gemini models": "Gemini",
+  "claude and gpt models": "Claude & GPT",
+}
+WINDOW_LABELS = {
+  "five hour": "5-hour",
+  "weekly": "Weekly",
+}
+
+
+def home() -> Path:
+  return Path(os.path.expanduser("~"))
+
+
+def gemini_dir() -> Path:
+  return Path(os.environ.get("ANTIGRAVITY_HOME") or home() / ".gemini")
+
+
+def cache_root() -> Path:
+  root = Path(os.environ.get("XDG_CACHE_HOME", home() / ".cache")) / "omarchy" / "agent-usage"
+  root.mkdir(parents=True, exist_ok=True)
+  return root
+
+
+def now_iso() -> str:
+  return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def date_string(value: dt.date) -> str:
+  return value.strftime("%Y-%m-%d")
+
+
+def recent_date_strings() -> list[str]:
+  today = dt.datetime.now().date()
+  return [date_string(today - dt.timedelta(days=offset)) for offset in range(6, -1, -1)]
+
+
+# --------------------------------------------------------------- protobuf wire
+
+def wire_fields(buf: bytes) -> list[tuple[int, str, object]]:
+  """Yield (field_number, kind, value) from one protobuf message.
+
+  kind is 'v' for varints and 'b' for length-delimited bytes; fixed32/64 are
+  consumed but reported as 'b' too. A malformed tail truncates the result
+  rather than raising.
+  """
+  out: list[tuple[int, str, object]] = []
+  i, n = 0, len(buf)
+
+  def varint(pos: int) -> tuple[int, int] | None:
+    value = shift = 0
+    while pos < n:
+      byte = buf[pos]
+      pos += 1
+      value |= (byte & 0x7F) << shift
+      shift += 7
+      if not byte & 0x80:
+        return value, pos
+      if shift > 70:
+        return None
+    return None
+
+  while i < n:
+    got = varint(i)
+    if got is None:
+      break
+    tag, i = got
+    fnum, wtype = tag >> 3, tag & 7
+    if fnum == 0:
+      break
+    if wtype == 0:
+      got = varint(i)
+      if got is None:
+        break
+      value, i = got
+      out.append((fnum, "v", value))
+    elif wtype == 2:
+      got = varint(i)
+      if got is None:
+        break
+      length, i = got
+      if i + length > n:
+        break
+      out.append((fnum, "b", buf[i:i + length]))
+      i += length
+    elif wtype == 5:
+      out.append((fnum, "b", buf[i:i + 4]))
+      i += 4
+    elif wtype == 1:
+      out.append((fnum, "b", buf[i:i + 8]))
+      i += 8
+    else:
+      break
+  return out
+
+
+def first(fields: list[tuple[int, str, object]], number: int, kind: str) -> object | None:
+  for fnum, fkind, value in fields:
+    if fnum == number and fkind == kind:
+      return value
+  return None
+
+
+# --------------------------------------------------------------- local stats
+
+def conversation_dbs() -> list[Path]:
+  base = gemini_dir()
+  paths: list[Path] = []
+  for sub in ("antigravity-cli/conversations", "antigravity/conversations"):
+    paths.extend(Path(p) for p in glob.glob(str(base / sub / "*.db")))
+  return sorted(paths)
+
+
+def session_created_date(conn: sqlite3.Connection, path: Path) -> str:
+  try:
+    row = conn.execute("SELECT data FROM trajectory_metadata_blob LIMIT 1").fetchone()
+    if row and row[0]:
+      created = first(wire_fields(row[0]), 2, "b")
+      if created is not None:
+        seconds = first(wire_fields(created), 1, "v")
+        if seconds and 10**8 < int(seconds) < 10**11:
+          return date_string(dt.datetime.fromtimestamp(int(seconds)).date())
+  except (sqlite3.Error, ValueError, OSError):
+    pass
+  return date_string(dt.datetime.fromtimestamp(path.stat().st_mtime).date())
+
+
+def scan_local_stats() -> dict:
+  per_day: dict[str, int] = {}
+  per_day_prompts: dict[str, int] = {}
+  per_day_sessions: dict[str, int] = {}
+  model_usage: dict[str, dict[str, int]] = {}
+  today_by_model: dict[str, dict[str, int]] = {}
+  seen_response_ids: set[bytes] = set()
+  total_prompts = total_sessions = 0
+  today = date_string(dt.datetime.now().date())
+
+  for path in conversation_dbs():
+    try:
+      conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1)
+    except sqlite3.Error:
+      continue
+    try:
+      try:
+        rows = conn.execute("SELECT data FROM gen_metadata ORDER BY idx").fetchall()
+      except sqlite3.Error:
+        continue
+      if not rows:
+        continue
+      day = session_created_date(conn, path)
+      session_counted = False
+      for (blob,) in rows:
+        if not blob:
+          continue
+        chat = first(wire_fields(blob), 1, "b")
+        if chat is None:
+          continue
+        chat_fields = wire_fields(chat)
+        model = first(chat_fields, 19, "b") or first(chat_fields, 21, "b")
+        model_id = model.decode("utf-8", "replace") if isinstance(model, bytes) else "unknown"
+        usage = first(chat_fields, 4, "b")
+        if usage is None:
+          continue
+        usage_fields = wire_fields(usage)
+        response_id = first(usage_fields, 11, "b")
+        if isinstance(response_id, bytes) and response_id:
+          if response_id in seen_response_ids:
+            continue
+          seen_response_ids.add(response_id)
+
+        def varint_of(number: int) -> int:
+          value = first(usage_fields, number, "v")
+          return int(value) if isinstance(value, int) and 0 <= value < 2**53 else 0
+
+        input_tokens = varint_of(1) + varint_of(2)
+        cache_read = varint_of(5)
+        output_tokens = varint_of(9) + varint_of(10)
+        turn_total = input_tokens + cache_read + output_tokens
+        if turn_total == 0:
+          continue
+
+        if not session_counted:
+          session_counted = True
+          total_sessions += 1
+          per_day_sessions[day] = per_day_sessions.get(day, 0) + 1
+        total_prompts += 1
+        per_day[day] = per_day.get(day, 0) + turn_total
+        per_day_prompts[day] = per_day_prompts.get(day, 0) + 1
+
+        for bucket, key in ((model_usage, model_id),) + (
+          ((today_by_model, model_id),) if day == today else ()
+        ):
+          entry = bucket.setdefault(key, {
+            "inputTokens": 0,
+            "outputTokens": 0,
+            "cacheReadInputTokens": 0,
+            "cacheCreationInputTokens": 0,
+          })
+          entry["inputTokens"] += input_tokens
+          entry["outputTokens"] += output_tokens
+          entry["cacheReadInputTokens"] += cache_read
+    finally:
+      conn.close()
+
+  return {
+    "perDay": per_day,
+    "perDayPrompts": per_day_prompts,
+    "perDaySessions": per_day_sessions,
+    "modelUsage": model_usage,
+    "todayTokensByModel": today_by_model,
+    "totalPrompts": total_prompts,
+    "totalSessions": total_sessions,
+    "scannedAt": time.time(),
+  }
+
+
+# --------------------------------------------------------------------- limits
+
+def find_agy() -> str | None:
+  override = os.environ.get("ANTIGRAVITY_BIN")
+  if override and os.access(override, os.X_OK):
+    return override
+  found = shutil.which("agy")
+  if found:
+    return found
+  for candidate in (home() / ".local/bin/agy", gemini_dir() / "bin/agy"):
+    if os.access(candidate, os.X_OK):
+      return str(candidate)
+  return None
+
+
+def parse_usage_output(text: str) -> list[dict]:
+  limits: list[dict] = []
+  for line in text.splitlines():
+    # agy prints tab-separated columns when stdout is not a TTY.
+    match = QUOTA_LINE.match(line.replace("\t", "  ").strip())
+    if not match:
+      continue
+    group = GROUP_LABELS.get(match.group("group").strip().lower(), match.group("group").strip())
+    window = WINDOW_LABELS.get(match.group("window").strip().lower(), match.group("window").strip())
+    remaining = min(100, max(0, int(match.group("pct"))))
+    limits.append({
+      "label": f"{group} {window}",
+      "percent": round((100 - remaining) / 100.0, 4),
+      "resetsAt": match.group("reset"),
+    })
+  # 5-hour before weekly within each group reads better on the meters.
+  limits.sort(key=lambda l: (0 if l["label"].startswith("Gemini") else 1,
+                             0 if "5-hour" in l["label"] else 1))
+  return limits
+
+
+def probe_limits(force: bool) -> dict:
+  cache_file = cache_root() / "antigravity-limits.json"
+  cached = None
+  try:
+    cached = json.loads(cache_file.read_text())
+  except (OSError, ValueError):
+    pass
+  if cached and not force and time.time() - cached.get("fetchedAt", 0) < LIMITS_REUSE_SECONDS:
+    return cached
+
+  agy = find_agy()
+  if agy is None:
+    return {"limits": [], "statusText": "agy is not installed", "authHelp": True,
+            "fetchedAt": time.time()}
+
+  lock_file = cache_root() / "antigravity-limits.lock"
+  with open(lock_file, "w") as lock:
+    try:
+      fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+      # Another collector run is already probing; reuse whatever we have.
+      return cached or {"limits": [], "statusText": "", "authHelp": False,
+                        "fetchedAt": 0}
+    try:
+      proc = subprocess.run(
+        [agy, "-p", "/usage"],
+        capture_output=True, text=True, timeout=USAGE_TIMEOUT_SECONDS,
+        cwd=str(home()),
+      )
+      limits = parse_usage_output(proc.stdout)
+      if limits:
+        result = {"limits": limits, "statusText": "", "authHelp": False,
+                  "fetchedAt": time.time()}
+      else:
+        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        result = {"limits": [], "authHelp": True, "fetchedAt": time.time(),
+                  "statusText": "Quota unavailable" + (f": {detail[-1][:120]}" if detail else "")}
+    except subprocess.TimeoutExpired:
+      result = {"limits": [], "statusText": "agy /usage timed out", "authHelp": False,
+                "fetchedAt": time.time()}
+    except OSError as error:
+      result = {"limits": [], "statusText": f"agy failed to run: {error}", "authHelp": False,
+                "fetchedAt": time.time()}
+
+  # A failed probe keeps the last good meters rather than blanking the panel,
+  # but carries the failure text so the hero can say the figures are stale.
+  if not result["limits"] and cached and cached.get("limits"):
+    result["limits"] = cached["limits"]
+  try:
+    cache_file.write_text(json.dumps(result))
+  except OSError:
+    pass
+  return result
+
+
+# --------------------------------------------------------------------- record
+
+def tier_label() -> str:
+  config = Path(os.environ.get("XDG_CONFIG_HOME", home() / ".config")) / "omarchy/agents/antigravity.json"
+  try:
+    return str(json.loads(config.read_text()).get("tierLabel", "")).strip()
+  except (OSError, ValueError):
+    return ""
+
+
+def build_record(stats: dict, limits: dict) -> dict:
+  per_day = stats.get("perDay", {})
+  today = date_string(dt.datetime.now().date())
+  active_dates = sorted(day for day, tokens in per_day.items() if tokens > 0)
+  return {
+    "schemaVersion": 1,
+    "id": AGENT_ID,
+    "name": AGENT_NAME,
+    "ready": True,
+    "tierLabel": tier_label(),
+    "usageStatusText": limits.get("statusText", ""),
+    "authHelpText": AUTH_HELP if limits.get("authHelp") else "",
+    "hasLocalStats": bool(per_day),
+    "limits": limits.get("limits", []),
+    "recentDays": [
+      {"date": day, "messageCount": per_day.get(day, 0)} for day in recent_date_strings()
+    ],
+    "modelUsage": stats.get("modelUsage", {}),
+    "todayTokensByModel": stats.get("todayTokensByModel", {}),
+    "todayTotalTokens": per_day.get(today, 0),
+    "todayPrompts": stats.get("perDayPrompts", {}).get(today, 0),
+    "todaySessions": stats.get("perDaySessions", {}).get(today, 0),
+    "totalPrompts": stats.get("totalPrompts", 0),
+    "totalSessions": stats.get("totalSessions", 0),
+    "activeDates": active_dates,
+    "activeDays": len(active_dates),
+    "updatedAt": now_iso(),
+  }
+
+
+def main() -> int:
+  parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+  parser.add_argument("--force", action="store_true",
+                      help="rescan conversations and re-probe limits, ignoring caches")
+  parser.add_argument("--limits-only", action="store_true",
+                      help="reuse any recent conversation scan; only the limits probe must be fresh")
+  args = parser.parse_args()
+
+  stats_cache = cache_root() / "antigravity-stats.json"
+  stats = None
+  if args.limits_only and not args.force:
+    try:
+      stats = json.loads(stats_cache.read_text())
+    except (OSError, ValueError):
+      stats = None
+  if stats is None:
+    stats = scan_local_stats()
+    try:
+      stats_cache.write_text(json.dumps(stats))
+    except OSError:
+      pass
+
+  # A machine with no agy and no conversations has nothing to report; failing
+  # keeps the panel from ever showing an empty Antigravity tab.
+  if find_agy() is None and not stats.get("perDay"):
+    print("antigravity: agy not installed and no conversation data found", file=sys.stderr)
+    return 1
+
+  limits = probe_limits(force=args.force)
+  json.dump(build_record(stats, limits), sys.stdout)
+  print()
+  return 0
+
+
+if __name__ == "__main__":
+  sys.exit(main())

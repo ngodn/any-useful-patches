@@ -1,0 +1,13 @@
+--- oa.orig	2026-09-01 10:30:55.428822823 +0800
++++ oa.new	2026-09-01 10:30:55.449236354 +0800
+@@ -62,6 +62,10 @@
+   command=(gemini --yolo)
+   [[ -n ${prompt:-} ]] && command+=(--prompt-interactive "$prompt")
+   ;;
++antigravity)
++  command=(agy --dangerously-skip-permissions)
++  [[ -n ${prompt:-} ]] && command+=(--prompt-interactive "$prompt")
++  ;;
+ copilot)
+   command=(copilot --allow-all)
+   [[ -n ${prompt:-} ]] && command+=(--interactive "$prompt")

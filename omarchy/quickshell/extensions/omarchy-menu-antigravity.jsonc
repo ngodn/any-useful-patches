@@ -1,0 +1,6 @@
+{
+  // Replace the Gemini row in Setup > Default Agent with Antigravity: Google
+  // retired the consumer Gemini CLI flow in favor of Antigravity (agy).
+  // Merge this row into ~/.config/omarchy/extensions/omarchy-menu.jsonc.
+  "setup.default.agent.gemini": {"icon":"󱓞","label":"Antigravity","checked":"[[ \"$(omarchy-default-agent)\" == \"antigravity\" ]]","action":"omarchy-default-agent antigravity"}
+}
