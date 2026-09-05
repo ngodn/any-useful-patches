@@ -26,6 +26,30 @@ This adds Google Antigravity as a first-class provider:
   Setup > Default Agent with Antigravity (merged into
   `~/.config/omarchy/extensions/omarchy-menu.jsonc`).
 
+It also fixes the stock Codex pane (see "Codex limits fix" below).
+
+## Codex limits fix (patches/omarchy-agent-usage-codex.patch)
+
+Codex is a built-in provider, but its pane never appeared: the stock
+collector probes limits by launching `codex -s read-only -a untrusted
+app-server`, and codex 0.153.4 removed the `untrusted` value for
+`--ask-for-approval` (now only `on-request` | `never`). The launch failed,
+so the record carried no limits and `providerHasData()` (which needs limits,
+a balance, or recorded usage) dropped it from the panel. The patch changes
+`-a untrusted` to `-a never`; the app-server is read-only here, so it never
+prompts anyway. After it, `account/rateLimits/read` returns the plan and the
+weekly window, the pane shows up, and it fills with token history once Codex
+is used locally.
+
+Notes on the RPC (codex 0.153.4, verified 2026-09-05): `account/read`
+returns `planType` (a ChatGPT Pro signup reports the raw value `prolite`,
+OpenAI's internal name for the $100 Pro tier; the panel title-cases it to
+"Prolite"). `account/rateLimits/read` returns a top-level
+`primary`/`secondary` pair (this account exposes only a weekly primary) plus
+a richer `rateLimitsByLimitId` map where per-model limits like
+`codex_bengalfox` carry both a 5-hour and weekly window; the collector reads
+only the top-level pair, matching stock behavior.
+
 ## How the collector works
 
 Rate limits: `agy -p "/usage"` prints the quota table (Gemini and
@@ -75,15 +99,19 @@ so after editing run `omarchy-restart-shell`.
 ```
 
 Collector and icons are additive files pacman does not own, so omarchy
-package upgrades keep them. The two launcher scripts ARE pacman-owned
-(symlinks in `$OMARCHY_PATH/bin` resolving to `/usr/bin`), so an omarchy
-upgrade reverts those patches: re-run `./install.sh` after upgrading
-(it detects already-patched files and skips them). If upstream omarchy ever
-ships its own antigravity support, delete
+package upgrades keep them. The patched files in `patches/` ARE pacman-owned
+(each named `<target-basename>.patch`; the bin entries are symlinks in
+`$OMARCHY_PATH/bin` resolving to `/usr/bin`): `omarchy-agent`,
+`omarchy-default-agent`, and `omarchy-agent-usage-codex`. An omarchy upgrade
+reverts them, so re-run `./install.sh` afterwards (it reverse-dry-runs each
+patch and skips ones already applied). A codex upgrade past 0.153.4 may make
+the codex patch a no-op or refuse to apply cleanly if upstream restored the
+flag; check whether the pane still works before worrying about it. If
+upstream omarchy ever ships its own antigravity support, delete
 `/usr/share/omarchy/bin/omarchy-agent-usage-antigravity`, the two svg
-assets, and the menu extension row, and skip the patches.
+assets, and the menu extension row, and skip the antigravity patches.
 
-Refresh manually: `omarchy agent usage-update antigravity` (or `--force`).
+Refresh manually: `omarchy agent usage-update <antigravity|codex>` (`--force`).
 Panel IPC: `omarchy-shell omarchy.agents <open|refresh|next>`.
 
 ## References

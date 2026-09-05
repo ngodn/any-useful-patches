@@ -20,8 +20,9 @@ pkexec bash -c "
   install -m644 '$PWD/assets/antigravity.svg' '$AGENTS_PLUGIN/assets/antigravity.svg'
   install -m644 '$PWD/assets/antigravity-light.svg' '$AGENTS_PLUGIN/assets/antigravity-light.svg'
   for p in '$PWD'/patches/*.patch; do
-    # bin entries may be symlinks into /usr/bin; patch the real file.
-    target=\$(readlink -f \"$OMARCHY/bin/\$(basename \"\$p\" -antigravity.patch)\")
+    # each patch is named <target-basename>.patch; bin entries may be symlinks
+    # into /usr/bin, so patch the real file.
+    target=\$(readlink -f \"$OMARCHY/bin/\$(basename \"\$p\" .patch)\")
     if patch -R -s -f --dry-run \"\$target\" <\"\$p\" >/dev/null 2>&1; then
       echo \"    \$target: already patched\"
     else

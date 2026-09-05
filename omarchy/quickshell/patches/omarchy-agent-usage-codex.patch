@@ -1,0 +1,13 @@
+--- a/usr/bin/omarchy-agent-usage-codex
++++ b/usr/bin/omarchy-agent-usage-codex
+@@ -528,7 +528,9 @@
+ 
+   try:
+     proc = subprocess.Popen(
+-      [codex, "-s", "read-only", "-a", "untrusted", "app-server"],
++      # codex 0.153.4 dropped the "untrusted" approval value (now on-request|never);
++      # app-server is read-only here anyway, so never-prompt is correct.
++      [codex, "-s", "read-only", "-a", "never", "app-server"],
+       stdin=subprocess.PIPE,
+       stdout=subprocess.PIPE,
+       stderr=subprocess.DEVNULL,
