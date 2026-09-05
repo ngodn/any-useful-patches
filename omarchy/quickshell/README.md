@@ -64,6 +64,23 @@ the panel status line. Calling the raw quota API directly
 tried first and 403s (SUBSCRIPTION_REQUIRED) for consumer logins unless you
 replicate agy's whole client identity, hence the CLI route.
 
+Plan name (the "Pro" / "Ultra" line under the mark): agy exposes no plan
+over the CLI or the cloudcode-pa REST API — its `SetUserTier` is empty for
+consumer Google AI accounts, and `retrieveUserQuotaSummary` 403s
+(SUBSCRIPTION_REQUIRED) without agy's full handshake. The plan lives only in
+the local language server agy runs while a session or the remote-control
+daemon is up: a Connect RPC, `GetUserStatus`, returns
+`planStatus.planInfo.planName`. The collector finds that server by scanning
+agy's own listening sockets (via `/proc`, skipping the HTTPS one), scrapes
+the CSRF token from the server's index HTML (`__APP_CONFIG__.csrfToken`), and
+POSTs `{}` to `/exa.language_server_pb.LanguageServerService/GetUserStatus`
+with `x-codeium-csrf-token`. The result is cached to
+`~/.cache/omarchy/agent-usage/antigravity-plan.json`, so the pane keeps
+naming the plan after agy exits. Precedence: a manual `tierLabel` in
+`~/.config/omarchy/agents/antigravity.json` wins, then the live plan, then
+the cached plan. (Antigravity is built on Codeium/Windsurf tech, hence the
+`exa.language_server_pb` service and `x-codeium-*` header.)
+
 Local token stats: the Antigravity CLI writes one SQLite db per
 conversation under `~/.gemini/antigravity-cli/conversations/`. Each
 `gen_metadata` row is a `GeneratorMetadata` protobuf; the collector ships a
@@ -129,7 +146,10 @@ Panel IPC: `omarchy-shell omarchy.agents <open|refresh|next>`.
 - `agy -p "/usage"` takes a few seconds and does not create conversation
   dbs or burn model quota (verified: db count unchanged, quota unchanged).
 - Day bucketing is per conversation, not per turn (see above).
-- The plan line (tierLabel) is blank by default; set it via
-  `~/.config/omarchy/agents/antigravity.json` -> `{"tierLabel": "Pro"}`.
+- The plan line (tierLabel) is auto-detected from the live language server
+  and cached (see "Plan name" above). It reads blank only if the plan has
+  never been fetched while agy was running; force a value with
+  `~/.config/omarchy/agents/antigravity.json` -> `{"tierLabel": "Pro"}`,
+  which overrides detection.
 - The `gemini` agent entry still exists and untouched; only the menu row was
   repointed at antigravity.

@@ -48,6 +48,8 @@ import sqlite3
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 AGENT_ID = "antigravity"
@@ -372,10 +374,125 @@ def probe_limits(force: bool) -> dict:
 
 # --------------------------------------------------------------------- record
 
-def tier_label() -> str:
-  config = Path(os.environ.get("XDG_CONFIG_HOME", home() / ".config")) / "omarchy/agents/antigravity.json"
+# --------------------------------------------------------------- plan / tier
+#
+# agy exposes no plan name over the CLI or the cloudcode-pa REST API (its
+# SetUserTier is empty for consumer Google AI accounts, and the REST quota
+# endpoint 403s without agy's full handshake). The one place the real plan
+# lives is the local language server agy runs while a session or the
+# remote-control daemon is up: a Connect RPC, GetUserStatus, returns
+# planStatus.planInfo.planName ("Pro", "Ultra", ...). It listens on a random
+# localhost port and is CSRF-gated, so we discover the port from agy's own
+# sockets and scrape the token from the server's index HTML. The plan is
+# cached to disk so the pane keeps naming the plan after agy exits.
+
+def _localhost_listen_ports_by_exe(exe_name: str) -> list[int]:
+  inode_to_port: dict[str, int] = {}
   try:
-    return str(json.loads(config.read_text()).get("tierLabel", "")).strip()
+    lines = Path("/proc/net/tcp").read_text().splitlines()[1:]
+  except OSError:
+    return []
+  for line in lines:
+    parts = line.split()
+    if len(parts) < 10 or parts[3] != "0A":  # 0A = LISTEN
+      continue
+    local, inode = parts[1], parts[9]
+    ip, _, port_hex = local.partition(":")
+    if ip.lower() != "0100007f":  # 127.0.0.1, little-endian
+      continue
+    inode_to_port[inode] = int(port_hex, 16)
+  ports: set[int] = set()
+  for pid in os.listdir("/proc"):
+    if not pid.isdigit():
+      continue
+    try:
+      if os.path.basename(os.readlink(f"/proc/{pid}/exe")) != exe_name:
+        continue
+    except OSError:
+      continue
+    for fd in glob.glob(f"/proc/{pid}/fd/*"):
+      try:
+        target = os.readlink(fd)
+      except OSError:
+        continue
+      match = re.match(r"socket:\[(\d+)\]", target)
+      if match and match.group(1) in inode_to_port:
+        ports.add(inode_to_port[match.group(1)])
+  return sorted(ports)
+
+
+def _get_user_status(port: int) -> dict | None:
+  base = f"http://127.0.0.1:{port}"
+  try:
+    html = urllib.request.urlopen(base + "/", timeout=2).read().decode("utf-8", "replace")
+  except (urllib.error.URLError, OSError, ValueError):
+    return None
+  if "antigravity" not in html:
+    return None
+  token = re.search(r'"csrfToken":"([^"]+)"', html)
+  if not token:
+    return None
+  request = urllib.request.Request(
+    base + "/exa.language_server_pb.LanguageServerService/GetUserStatus",
+    data=b"{}",
+    headers={
+      "Content-Type": "application/json",
+      "Connect-Protocol-Version": "1",
+      "x-codeium-csrf-token": token.group(1),
+    },
+  )
+  try:
+    return json.load(urllib.request.urlopen(request, timeout=5))
+  except (urllib.error.URLError, OSError, ValueError):
+    return None
+
+
+def fetch_plan_name() -> str:
+  """The plan name from a live language server, or '' when none is reachable."""
+  for port in _localhost_listen_ports_by_exe("agy"):
+    status = _get_user_status(port)
+    if not status:
+      continue
+    plan = (
+      status.get("userStatus", {})
+      .get("planStatus", {})
+      .get("planInfo", {})
+      .get("planName", "")
+    )
+    if plan:
+      return str(plan).strip()
+  return ""
+
+
+def config_dir() -> Path:
+  return Path(os.environ.get("XDG_CONFIG_HOME", home() / ".config")) / "omarchy/agents"
+
+
+def config_tier_label() -> str:
+  try:
+    return str(json.loads((config_dir() / "antigravity.json").read_text()).get("tierLabel", "")).strip()
+  except (OSError, ValueError):
+    return ""
+
+
+def tier_label() -> str:
+  # A manual override always wins, so the user can force a label. Otherwise
+  # use the live plan and remember it; fall back to the last one we saw when
+  # no language server is up.
+  override = config_tier_label()
+  if override:
+    return override
+
+  cache_file = cache_root() / "antigravity-plan.json"
+  plan = fetch_plan_name()
+  if plan:
+    try:
+      cache_file.write_text(json.dumps({"planName": plan, "fetchedAt": time.time()}))
+    except OSError:
+      pass
+    return plan
+  try:
+    return str(json.loads(cache_file.read_text()).get("planName", "")).strip()
   except (OSError, ValueError):
     return ""
 
