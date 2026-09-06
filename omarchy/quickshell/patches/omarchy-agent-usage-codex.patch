@@ -11,3 +11,21 @@
        stdin=subprocess.PIPE,
        stdout=subprocess.PIPE,
        stderr=subprocess.DEVNULL,
+@@ -550,7 +552,16 @@
+     account = (account_msg.get("result") or {}).get("account") or {}
+     limits = (limits_msg.get("result") or {}).get("rateLimits") or {}
+     plan = limits.get("planType") or account.get("planType") or account.get("type") or ""
+-    result["tierLabel"] = str(plan) if plan else ""
++    # OpenAI split Pro into Pro 5x ($100, planType "prolite") and Pro 20x
++    # ($200, "pro") on 2026-04-09; surface the multiplier the way Claude shows
++    # "Max 5x". Unknown plans fall back to their title-cased raw value.
++    plan_labels = {
++      "pro": "Pro 20x", "prolite": "Pro 5x", "plus": "Plus", "go": "Go",
++      "free": "Free", "team": "Team", "business": "Business",
++      "enterprise": "Enterprise", "edu": "Edu",
++    }
++    plan_key = str(plan).strip().lower()
++    result["tierLabel"] = plan_labels.get(plan_key, plan_key.title()) if plan_key else ""
+ 
+     for window in (limits.get("primary"), limits.get("secondary")):
+       entry = limit_window(window)

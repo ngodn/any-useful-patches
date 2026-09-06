@@ -41,10 +41,12 @@ prompts anyway. After it, `account/rateLimits/read` returns the plan and the
 weekly window, the pane shows up, and it fills with token history once Codex
 is used locally.
 
-Notes on the RPC (codex 0.153.4, verified 2026-09-05): `account/read`
-returns `planType` (a ChatGPT Pro signup reports the raw value `prolite`,
-OpenAI's internal name for the $100 Pro tier; the panel title-cases it to
-"Prolite"). `account/rateLimits/read` returns a top-level
+Notes on the RPC (codex 0.153.4, verified 2026-09-06): `account/read`
+returns `planType`. OpenAI split Pro on 2026-04-09 into Pro 5x ($100,
+`prolite`) and Pro 20x ($200, `pro`), so the patch maps `planType` to a
+Claude-style label with the multiplier: `pro` -> "Pro 20x", `prolite` ->
+"Pro 5x", `plus` -> "Plus", etc.; unknown plans fall back to their
+title-cased raw value. `account/rateLimits/read` returns a top-level
 `primary`/`secondary` pair (this account exposes only a weekly primary) plus
 a richer `rateLimitsByLimitId` map where per-model limits like
 `codex_bengalfox` carry both a 5-hour and weekly window; the collector reads
@@ -69,8 +71,13 @@ over the CLI or the cloudcode-pa REST API — its `SetUserTier` is empty for
 consumer Google AI accounts, and `retrieveUserQuotaSummary` 403s
 (SUBSCRIPTION_REQUIRED) without agy's full handshake. The plan lives only in
 the local language server agy runs while a session or the remote-control
-daemon is up: a Connect RPC, `GetUserStatus`, returns
-`planStatus.planInfo.planName`. The collector finds that server by scanning
+daemon is up: a Connect RPC, `GetUserStatus`, whose `userStatus.userTier`
+carries the real Google One subscription (`id` like `g1-ultra-lite-tier`,
+`name` "Google AI Ultra"). The `id` encodes the multiplier — `ultra-lite` is
+5x, `ultra` is 20x, `pro` is the AI Pro baseline — so the collector builds a
+Claude-style label ("Ultra 5x"). This differs from the internal
+`planStatus.planInfo.planName`, which reads "Pro" for everyone and is only a
+fallback. The collector finds that server by scanning
 agy's own listening sockets (via `/proc`, skipping the HTTPS one), scrapes
 the CSRF token from the server's index HTML (`__APP_CONFIG__.csrfToken`), and
 POSTs `{}` to `/exa.language_server_pb.LanguageServerService/GetUserStatus`

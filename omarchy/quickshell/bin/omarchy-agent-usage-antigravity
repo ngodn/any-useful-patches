@@ -447,18 +447,41 @@ def _get_user_status(port: int) -> dict | None:
     return None
 
 
+def plan_label_from_user_tier(user_tier: dict) -> str:
+  """Build a Claude-style label ("Ultra 5x", "Pro") from the Google One tier.
+
+  `userStatus.userTier` is the real Google AI subscription (distinct from the
+  internal Codeium `planInfo.planName`, which reads "Pro" for everyone). Its
+  `id` carries the multiplier: g1-ultra-lite-tier is Ultra 5x ($100),
+  g1-ultra-tier is Ultra 20x ($200), g1-pro-tier is the AI Pro baseline. The
+  `name` ("Google AI Ultra") gives the tier word once the marketing prefix is
+  stripped.
+  """
+  tier_id = str(user_tier.get("id", "")).lower()
+  name = str(user_tier.get("name", "")).strip()
+  short = re.sub(r"(?i)^google\s+ai\s+", "", name).strip() or name
+  if "ultra" in tier_id:
+    multiplier = "5x" if "lite" in tier_id else "20x"
+  elif "pro" in tier_id:
+    multiplier = "5x" if "lite" in tier_id else ""
+  else:
+    multiplier = ""
+  return (short + " " + multiplier).strip() if short else ""
+
+
 def fetch_plan_name() -> str:
-  """The plan name from a live language server, or '' when none is reachable."""
+  """The plan label from a live language server, or '' when none is reachable."""
   for port in _localhost_listen_ports_by_exe("agy"):
     status = _get_user_status(port)
     if not status:
       continue
-    plan = (
-      status.get("userStatus", {})
-      .get("planStatus", {})
-      .get("planInfo", {})
-      .get("planName", "")
-    )
+    user_status = status.get("userStatus", {})
+    # The Google One subscription is authoritative; the internal planName is
+    # a last resort for a shape that omits userTier.
+    label = plan_label_from_user_tier(user_status.get("userTier", {}) or {})
+    if label:
+      return label
+    plan = user_status.get("planStatus", {}).get("planInfo", {}).get("planName", "")
     if plan:
       return str(plan).strip()
   return ""
