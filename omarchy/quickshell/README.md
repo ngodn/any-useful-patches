@@ -26,31 +26,44 @@ This adds Google Antigravity as a first-class provider:
   Setup > Default Agent with Antigravity (merged into
   `~/.config/omarchy/extensions/omarchy-menu.jsonc`).
 
-It also fixes the stock Codex pane (see "Codex limits fix" below).
+It also relabels the plan on the stock Codex pane (see "Codex plan label"
+below).
 
-## Codex limits fix (patches/omarchy-agent-usage-codex.patch)
+## Codex plan label (patches/omarchy-agent-usage-codex.patch)
 
-Codex is a built-in provider, but its pane never appeared: the stock
-collector probes limits by launching `codex -s read-only -a untrusted
-app-server`, and codex 0.153.4 removed the `untrusted` value for
-`--ask-for-approval` (now only `on-request` | `never`). The launch failed,
-so the record carried no limits and `providerHasData()` (which needs limits,
-a balance, or recorded usage) dropped it from the panel. The patch changes
-`-a untrusted` to `-a never`; the app-server is read-only here, so it never
-prompts anyway. After it, `account/rateLimits/read` returns the plan and the
-weekly window, the pane shows up, and it fills with token history once Codex
-is used locally.
+The stock collector shows the raw `planType` from the Codex app-server as
+the plan name, so a ChatGPT Pro account reads just "pro". OpenAI has sold
+two Pro tiers since 2026-04-09: $100 (`prolite`) and $200 (`pro`). The patch
+maps `planType` to a label with the price: `pro` -> "Pro 200", `prolite` ->
+"Pro 100", `plus` -> "Plus", etc.; unknown plans fall back to their
+title-cased raw value.
 
-Notes on the RPC (codex 0.153.4, verified 2026-09-06): `account/read`
-returns `planType`. OpenAI split Pro on 2026-04-09 into Pro 5x ($100,
-`prolite`) and Pro 20x ($200, `pro`), so the patch maps `planType` to a
-Claude-style label with the multiplier: `pro` -> "Pro 20x", `prolite` ->
-"Pro 5x", `plus` -> "Plus", etc.; unknown plans fall back to their
-title-cased raw value. `account/rateLimits/read` returns a top-level
-`primary`/`secondary` pair (this account exposes only a weekly primary) plus
-a richer `rateLimitsByLimitId` map where per-model limits like
-`codex_bengalfox` carry both a 5-hour and weekly window; the collector reads
-only the top-level pair, matching stock behavior.
+The patch also fixes an intermittent "Codex limits unavailable" with
+`account/read` (or `initialize`) as the detail line (2026-10-22). The stock
+`rpc_request` waits with `select()` on the pipe but reads with buffered
+`readline()`. The app-server often writes two lines back to back (the
+`initialize` reply plus a `remoteControl/status/changed` notification, or
+`account/updated` plus the `account/read` reply, and the mise shim's banner
+line before everything). When those land in one read, `readline()` pulls all
+of them into Python's buffer and returns only the first. `select()` then waits
+on a pipe that has nothing new, and the reply that is already buffered times
+out. That is more likely when the machine is busy, which is why it came and
+went. The patch reads the fd with `os.read` and splits lines from its own
+buffer, carried over between requests. Reproduced by delaying each
+`select()` by 0.5 s: stock failed 5 of 5 probes, patched passed 5 of 5.
+
+History: this patch used to also change the probe's `-a untrusted` to
+`-a never`, because codex 0.153.4 removed the `untrusted` value for
+`--ask-for-approval` and the failed launch hid the whole pane. Omarchy 4.0.4
+ships `-a on-request` itself, so that hunk is gone and only the label hunk
+is left (rebuilt against 4.0.4 on 2026-10-12).
+
+Notes on the RPC (codex 0.162.1): `account/read` returns `planType`.
+`account/rateLimits/read` returns a top-level `primary`/`secondary` pair
+(this account exposes only a weekly primary) plus a richer
+`rateLimitsByLimitId` map where per-model limits like `codex_bengalfox`
+carry both a 5-hour and weekly window; the collector reads only the
+top-level pair, matching stock behavior.
 
 ## How the collector works
 
@@ -128,9 +141,7 @@ package upgrades keep them. The patched files in `patches/` ARE pacman-owned
 `$OMARCHY_PATH/bin` resolving to `/usr/bin`): `omarchy-agent`,
 `omarchy-default-agent`, and `omarchy-agent-usage-codex`. An omarchy upgrade
 reverts them, so re-run `./install.sh` afterwards (it reverse-dry-runs each
-patch and skips ones already applied). A codex upgrade past 0.153.4 may make
-the codex patch a no-op or refuse to apply cleanly if upstream restored the
-flag; check whether the pane still works before worrying about it. If
+patch and skips ones already applied). If
 upstream omarchy ever ships its own antigravity support, delete
 `/usr/share/omarchy/bin/omarchy-agent-usage-antigravity`, the two svg
 assets, and the menu extension row, and skip the antigravity patches.

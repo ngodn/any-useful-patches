@@ -1,26 +1,63 @@
 --- a/usr/bin/omarchy-agent-usage-codex
 +++ b/usr/bin/omarchy-agent-usage-codex
-@@ -528,7 +528,9 @@
+@@ -479,19 +479,34 @@
+   proc.stdin.write(json.dumps(payload) + "\n")
+   proc.stdin.flush()
+   deadline = time.time() + timeout
+-  while time.time() < deadline:
+-    ready, _, _ = select.select([proc.stdout], [], [], 0.25)
+-    if not ready:
+-      continue
+-    line = proc.stdout.readline()
+-    if not line:
+-      break
+-    try:
+-      message = json.loads(line)
+-    except Exception:
+-      continue
+-    if message.get("id") == request_id:
+-      return message
++  # Read the pipe ourselves. select() only sees the OS pipe, so pairing it
++  # with buffered readline() strands any reply that arrived in the same chunk
++  # as an earlier line (common when the system is busy), and the request
++  # times out even though the answer is already here. Leftover bytes carry
++  # over to the next request on the same process.
++  buf = getattr(proc, "rpc_buffer", b"")
++  try:
++    while True:
++      while b"\n" in buf:
++        line, buf = buf.split(b"\n", 1)
++        try:
++          message = json.loads(line)
++        except Exception:
++          continue
++        if isinstance(message, dict) and message.get("id") == request_id:
++          return message
++      remaining = deadline - time.time()
++      if remaining <= 0:
++        break
++      ready, _, _ = select.select([proc.stdout], [], [], min(remaining, 0.25))
++      if not ready:
++        continue
++      chunk = os.read(proc.stdout.fileno(), 65536)
++      if not chunk:
++        break
++      buf += chunk
++  finally:
++    proc.rpc_buffer = buf
+   raise TimeoutError(method)
  
-   try:
-     proc = subprocess.Popen(
--      [codex, "-s", "read-only", "-a", "untrusted", "app-server"],
-+      # codex 0.153.4 dropped the "untrusted" approval value (now on-request|never);
-+      # app-server is read-only here anyway, so never-prompt is correct.
-+      [codex, "-s", "read-only", "-a", "never", "app-server"],
-       stdin=subprocess.PIPE,
-       stdout=subprocess.PIPE,
-       stderr=subprocess.DEVNULL,
-@@ -550,7 +552,16 @@
+ 
+@@ -550,7 +565,16 @@
      account = (account_msg.get("result") or {}).get("account") or {}
      limits = (limits_msg.get("result") or {}).get("rateLimits") or {}
      plan = limits.get("planType") or account.get("planType") or account.get("type") or ""
 -    result["tierLabel"] = str(plan) if plan else ""
-+    # OpenAI split Pro into Pro 5x ($100, planType "prolite") and Pro 20x
-+    # ($200, "pro") on 2026-04-09; surface the multiplier the way Claude shows
-+    # "Max 5x". Unknown plans fall back to their title-cased raw value.
++    # OpenAI sells two Pro tiers since 2026-04-09: $100 (planType "prolite")
++    # and $200 ("pro"). Label them by price. Unknown plans fall back to their
++    # title-cased raw value.
 +    plan_labels = {
-+      "pro": "Pro 20x", "prolite": "Pro 5x", "plus": "Plus", "go": "Go",
++      "pro": "Pro 200", "prolite": "Pro 100", "plus": "Plus", "go": "Go",
 +      "free": "Free", "team": "Team", "business": "Business",
 +      "enterprise": "Enterprise", "edu": "Edu",
 +    }
